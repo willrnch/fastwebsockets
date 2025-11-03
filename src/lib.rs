@@ -175,6 +175,9 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 
+use miniz_oxide::{DataFormat, MZFlush};
+use miniz_oxide::inflate::stream::{InflateState, inflate};
+
 pub use crate::close::CloseCode;
 pub use crate::error::WebSocketError;
 pub use crate::fragment::FragmentCollector;
@@ -681,7 +684,11 @@ impl ReadHalf {
     let rsv2 = self.buffer[0] & 0b00100000 != 0;
     let rsv3 = self.buffer[0] & 0b00010000 != 0;
 
-    if rsv1 || rsv2 || rsv3 {
+    let mut compressed = false;
+
+    if rsv1 && !rsv2 && !rsv3 {
+      compressed = true;
+    } else if rsv1 || rsv2 || rsv3 {
       return Err(WebSocketError::ReservedBitsNotZero);
     }
 
@@ -743,7 +750,11 @@ impl ReadHalf {
     }
 
     // if we read too much it will stay in the buffer, for the next call to this method
-    let payload = self.buffer.split_to(payload_len);
+    let mut payload = self.buffer.split_to(payload_len);
+    if compressed {
+      payload = BytesMut::from(inflate_payload(&payload.to_vec())?.as_slice());
+    }
+
     let frame = Frame::new(fin, opcode, mask, Payload::Bytes(payload));
     Ok(frame)
   }
@@ -819,4 +830,26 @@ mod tests {
     }
     assert_unsync::<WebSocket<tokio::net::TcpStream>>();
   };
+}
+
+fn inflate_payload(
+  payload: &Vec<u8>
+) -> Result<Vec<u8>, WebSocketError>
+{
+  let max_output_size = usize::max_value();
+  let mut out: Vec<u8> = vec![0; payload.len().saturating_mul(2).min(max_output_size)];
+  let mut state = InflateState::new_boxed(DataFormat::Raw);
+
+  let payload = [payload.as_slice(), [0x00, 0x00, 0xff, 0xff].as_slice()].concat();
+  let res = inflate(&mut state, &payload, &mut out, MZFlush::Partial);
+
+  match res.status {
+    Ok(_) => {
+      out.truncate(res.bytes_written);
+      Ok(out)
+    }
+    Err(_) => {
+      Err(WebSocketError::InvalidEncoding)
+    }
+  }
 }
